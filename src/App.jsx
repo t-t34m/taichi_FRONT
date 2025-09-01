@@ -1,59 +1,71 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Platform, View, Text, Button, StyleSheet } from "react-native";
+import './app.css';
 
-// Only available in Expo (mobile)
-import { Camera } from "expo-camera";
 
-const API_URL = "https://taichi-1.onrender.com/analyze_video/";
+/**
+ * CameraRecorder
+ * - Opens the camera + mic
+ * - 5s countdown before recording starts
+ * - Records exactly 60s (auto-stops)
+ * - Lets you upload the recorded file OR a user-selected file
+ * - Validates ~60s duration on chosen files
+ * - Sends video via multipart/form-data to a FastAPI endpoint
+ */
+
+const API_URL = "https://taichi-1.onrender.com/analyze_video/"; // updated endpoint
+
+function pickSupportedMime() {
+  const options = [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+    "video/mp4", // some browsers may allow this, most will not via MediaRecorder
+  ];
+  for (const type of options) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) {
+      return { mimeType: type };
+    }
+  }
+  return undefined; // let browser choose
+}
 
 function formatSeconds(total) {
-  const m = Math.floor(total / 60).toString().padStart(2, "0");
-  const s = Math.floor(total % 60).toString().padStart(2, "0");
+  const m = Math.floor(total / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(total % 60)
+    .toString()
+    .padStart(2, "0");
   return `${m}:${s}`;
 }
 
 export default function CameraRecorder() {
-  // Common state
-  const [status, setStatus] = useState("idle");
-  const [secondsLeft, setSecondsLeft] = useState(60);
-  const [countdown, setCountdown] = useState(5);
-  const [error, setError] = useState("");
-  const [accuracy, setAccuracy] = useState(null);
-
-  // --- Web recording refs ---
   const videoRef = useRef(null);
+  const previewRef = useRef(null);
   const recorderRef = useRef(null);
-  const streamRef = useRef(null);
   const chunksRef = useRef([]);
+  const streamRef = useRef(null);
+  const countdownTimerRef = useRef(null);
+  const stopTimerRef = useRef(null);
 
+  const [status, setStatus] = useState("idle"); 
+  const [countdown, setCountdown] = useState(5);
+  const [secondsLeft, setSecondsLeft] = useState(60);
   const [blobUrl, setBlobUrl] = useState(null);
   const [recordedBlob, setRecordedBlob] = useState(null);
+  const [error, setError] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedDuration, setSelectedDuration] = useState(null);
+  const [accuracy, setAccuracy] = useState(null); // NEW state
 
-  // --- Mobile recording refs ---
-  const cameraRef = useRef(null);
-  const [recording, setRecording] = useState(false);
-  const [videoUri, setVideoUri] = useState(null);
-
-  // Cleanup on unmount
   useEffect(() => {
-    return () => cleanup();
+    return () => {
+      cleanup();
+    };
   }, []);
 
-  const cleanup = () => {
-    try {
-      if (Platform.OS === "web") {
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((t) => t.stop());
-          streamRef.current = null;
-        }
-        if (blobUrl) URL.revokeObjectURL(blobUrl);
-      }
-    } catch {}
-  };
-
-  // --- Web: ensure stream ---
   const ensureStream = async () => {
-    if (Platform.OS !== "web") return;
     if (streamRef.current) return streamRef.current;
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -68,12 +80,13 @@ export default function CameraRecorder() {
     return stream;
   };
 
-  // --- Web: start recording ---
-  const startWebRecording = async () => {
+  const start = async () => {
+    setError("");
+    setBlobUrl(null);
+    setRecordedBlob(null);
+    setAccuracy(null);
+
     try {
-      setError("");
-      setBlobUrl(null);
-      setRecordedBlob(null);
       const stream = await ensureStream();
       chunksRef.current = [];
 
@@ -81,12 +94,12 @@ export default function CameraRecorder() {
       setStatus("countdown");
 
       let remaining = 5;
-      const timer = setInterval(() => {
+      countdownTimerRef.current = setInterval(() => {
         remaining -= 1;
         setCountdown(remaining);
         if (remaining <= 0) {
-          clearInterval(timer);
-          beginWebRecording(stream);
+          clearInterval(countdownTimerRef.current);
+          beginRecording(stream);
         }
       }, 1000);
     } catch (e) {
@@ -95,152 +108,239 @@ export default function CameraRecorder() {
     }
   };
 
-  const beginWebRecording = (stream) => {
-    const rec = new MediaRecorder(stream);
-    recorderRef.current = rec;
+  const beginRecording = (stream) => {
+    try {
+      const opts = pickSupportedMime();
+      const rec = new MediaRecorder(stream, opts);
+      recorderRef.current = rec;
 
-    rec.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-    };
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
 
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: rec.mimeType || "video/webm" });
-      const url = URL.createObjectURL(blob);
-      setRecordedBlob(blob);
-      setBlobUrl(url);
-      setStatus("finished");
+      rec.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: rec.mimeType || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        setRecordedBlob(blob);
+        setBlobUrl(url);
+        setStatus("finished");
+        setSecondsLeft(60);
+      };
+
+      rec.start();
+      setStatus("recording");
       setSecondsLeft(60);
-    };
 
-    rec.start();
-    setStatus("recording");
-    setSecondsLeft(60);
-
-    const startedAt = Date.now();
-    const tick = () => {
-      const elapsed = (Date.now() - startedAt) / 1000;
-      const left = Math.max(0, 60 - elapsed);
-      setSecondsLeft(left);
-      if (left <= 0 || rec.state !== "recording") return;
+      const startedAt = Date.now();
+      const tick = () => {
+        const elapsed = (Date.now() - startedAt) / 1000;
+        const left = Math.max(0, 60 - elapsed);
+        setSecondsLeft(left);
+        if (left <= 0 || rec.state !== "recording") return;
+        requestAnimationFrame(tick);
+      };
       requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
 
-    setTimeout(() => stopWebRecording(), 60_000);
+      stopTimerRef.current = setTimeout(() => stop(), 60_000);
+    } catch (e) {
+      setError(String(e));
+      setStatus("error");
+    }
   };
 
-  const stopWebRecording = () => {
+  const stop = () => {
     try {
       if (recorderRef.current && recorderRef.current.state === "recording") {
         recorderRef.current.stop();
       }
+      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
     } catch {}
   };
 
-  // --- Mobile: start recording ---
-  const startMobileRecording = async () => {
-    if (!cameraRef.current) return;
-    setRecording(true);
-    setError("");
-    setVideoUri(null);
+  const cleanup = () => {
     try {
-      const video = await cameraRef.current.recordAsync({
-        maxDuration: 60,
-        quality: "720p",
-      });
-      setVideoUri(video.uri);
-    } catch (e) {
-      setError(String(e));
-    }
-    setRecording(false);
+      stop();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    } catch {}
   };
 
-  const stopMobileRecording = () => {
-    if (cameraRef.current) {
-      cameraRef.current.stopRecording();
-    }
+  const validateDurationApprox60 = async (file) => {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const el = document.createElement("video");
+      el.preload = "metadata";
+      el.onloadedmetadata = () => {
+        const d = el.duration;
+        URL.revokeObjectURL(url);
+        resolve(d);
+      };
+      el.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(NaN);
+      };
+      el.src = url;
+    });
   };
 
-  // --- Send video (web or mobile) ---
+  const handleFilePick = async (e) => {
+    const f = e.target.files?.[0];
+    setSelectedFile(null);
+    setSelectedDuration(null);
+    setError("");
+    if (!f) return;
+    const dur = await validateDurationApprox60(f);
+    setSelectedDuration(dur);
+    if (!isFinite(dur) || Math.abs(dur - 60) > 3) {
+      setError(`Selected video must be ~60s. Detected ${isFinite(dur) ? dur.toFixed(2) : "unknown"}s.`);
+      return;
+    }
+    setSelectedFile(f);
+  };
+
   const send = async (file, sourceLabel) => {
     try {
+      setIsSending(true);
+      setError("");
       const fd = new FormData();
-      fd.append("file", file, file.name || `${sourceLabel}.webm`);
+      fd.append("file", file, file.name || `${sourceLabel || "video"}.webm`);
+      fd.append("source", sourceLabel || "unknown");
+
       const res = await fetch(API_URL, { method: "POST", body: fd });
+      if (!res.ok) throw new Error(`Upload failed: ${res.status} ${res.statusText}`);
       const json = await res.json().catch(() => ({}));
+
       if (json && json.probabilities !== undefined) {
-        setAccuracy((json.probabilities * 100).toFixed(2));
+        setAccuracy((json.probabilities * 100).toFixed(2)); // convert to %
       }
     } catch (e) {
       setError(String(e));
+    } finally {
+      setIsSending(false);
     }
   };
 
-  const sendWeb = async () => {
+  const sendRecorded = async () => {
     if (!recordedBlob) return;
-    const file = new File([recordedBlob], `recorded-${Date.now()}.webm`, { type: "video/webm" });
-    await send(file, "web");
+    const named = new File([recordedBlob], `recorded-${Date.now()}.webm`, { type: recordedBlob.type || "video/webm" });
+    await send(named, "recorded");
   };
 
-  // For Expo, you’ll need to fetch videoUri → blob → File before sending
-  const sendMobile = async () => {
-    if (!videoUri) return;
-    const response = await fetch(videoUri);
-    const blob = await response.blob();
-    const file = new File([blob], `recorded-${Date.now()}.mp4`, { type: "video/mp4" });
-    await send(file, "mobile");
+  const sendSelected = async () => {
+    if (!selectedFile) return;
+    await send(selectedFile, "uploaded");
   };
 
-  // --- UI ---
-  if (Platform.OS === "web") {
-    return (
-      <div className="p-6 flex flex-col items-center gap-4">
-        <h1>🎥 Web Camera Recorder</h1>
-        <video ref={videoRef} className="w-full max-w-lg bg-black" autoPlay playsInline muted />
-        <div className="flex gap-2">
-          <button onClick={ensureStream}>📷 Open Camera</button>
-          <button onClick={startWebRecording}>▶️ Start</button>
-          <button onClick={stopWebRecording}>⏹️ Stop</button>
-        </div>
-        {blobUrl && (
-          <div>
-            <video src={blobUrl} controls className="w-full max-w-lg mt-2" />
-            <button onClick={sendWeb}>🚀 Send</button>
-          </div>
-        )}
-        {accuracy && <p>Accuracy: {accuracy}%</p>}
-        {error && <p style={{ color: "red" }}>{error}</p>}
-      </div>
-    );
-  }
-
-  // --- Mobile UI (Expo) ---
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>🎥 Mobile Camera Recorder</Text>
-      <Camera style={styles.camera} type={Camera.Constants.Type.front} ref={cameraRef} />
-      <View style={styles.controls}>
-        {!recording ? (
-          <Button title="▶️ Start" onPress={startMobileRecording} />
-        ) : (
-          <Button title="⏹️ Stop" onPress={stopMobileRecording} />
-        )}
-      </View>
-      {videoUri && (
-        <View style={{ marginTop: 10 }}>
-          <Text>Video saved at: {videoUri}</Text>
-          <Button title="🚀 Send" onPress={sendMobile} />
-        </View>
-      )}
-      {accuracy && <Text>Accuracy: {accuracy}%</Text>}
-      {error ? <Text style={{ color: "red" }}>{error}</Text> : null}
-    </View>
+  <div className="flex flex-col lg:flex-row gap-8 max-w-6xl mx-auto items-center justify-center">
+
+
+    <div className="flex flex-col items-center gap-8">
+      <h1 className="">🎥 Camera Recorder</h1>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 max-w-6xl mx-auto">
+        {/* Camera Section */}
+        <div className="bg-slate-900 rounded-2xl p-4 shadow-lg border border-slate-800 flex flex-col items-center">
+          <div className="relative w-full">
+            <video ref={videoRef} className="w-full aspect-video bg-black rounded-xl" muted playsInline autoPlay />
+            {status === "countdown" && (
+              <div className="absolute inset-0 flex items-center justify-center text-6xl font-bold text-white bg-black/40">
+                {countdown}
+              </div>
+            )}
+            {status === "recording" && (
+              <span className="absolute top-3 left-3 px-3 py-1 rounded-full bg-red-600 text-xs font-bold animate-pulse">
+                ● Recording {formatSeconds(secondsLeft)}
+              </span>
+            )}
+          </div>
+
+          <div className="flex gap-4 mt-6">
+            <button onClick={ensureStream} disabled={status!=="idle"&&status!=="ready"} 
+              className="p-4 rounded-full bg-slate-700 hover:bg-slate-600 disabled:opacity-40">
+              📷
+            </button>
+            <button onClick={start} disabled={status!=="ready"&&status!=="finished"} 
+              className="p-4 rounded-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40">
+              ▶️
+            </button>
+            <button onClick={stop} disabled={status!=="recording"&&status!=="countdown"} 
+              className="p-4 rounded-full bg-red-700 hover:bg-red-600 disabled:opacity-40">
+              ⏹️
+            </button>
+          </div>
+
+          {error && <div className="mt-4 text-sm text-red-400">{error}</div>}
+        </div>
+
+        {/* Preview & Upload */}
+        <div className="bg-slate-900 rounded-2xl p-4 shadow-lg border border-slate-800">
+          <h2 className="text-lg font-semibold mb-3">Preview & Upload</h2>
+          
+          <video ref={previewRef} className="w-full aspect-video bg-black rounded-xl mb-4" controls src={blobUrl || undefined} />
+
+          <div className="flex gap-3 mb-4">
+            <button onClick={sendRecorded} disabled={!recordedBlob || isSending}
+              className="flex-1 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40">
+              🚀 Send Recorded
+            </button>
+            <a download href={blobUrl || undefined}
+              className={`flex-1 px-4 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 ${!blobUrl ? "opacity-40 pointer-events-none" : ""}`}>
+              💾 Download
+            </a>
+          </div>
+
+          <label className="block text-sm mb-2">Or upload a 1-minute video:</label>
+          <input type="file" accept="video/*" onChange={handleFilePick}
+            className="block w-full text-sm file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-blue-600 file:text-white hover:file:bg-blue-500" />
+          
+          {selectedFile && (
+            <p className="mt-2 text-sm text-slate-300">
+              {selectedFile.name} — ~{selectedDuration?.toFixed(2)}s
+            </p>
+          )}
+          <button onClick={sendSelected} disabled={!selectedFile || isSending}
+            className="mt-3 w-full px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40">
+            📤 Send Uploaded
+          </button>
+
+          {accuracy !== null && (
+          <div className="mt-6 flex justify-center">
+            <div className="relative w-28 h-28 flex items-center justify-center">
+              {/* Percentage text in center */}
+              <span className="absolute text-lg font-bold text-white">{accuracy}%</span>
+              
+              {/* Circle background + foreground */}
+              <svg className="w-full h-full -rotate-90">
+                {/* Background circle (gray track) */}
+                <circle
+                  cx="50%" cy="50%" r="45%"
+                  stroke="gray"
+                  strokeWidth="8"
+                  fill="none"
+                />
+                {/* Foreground circle (progress ring) */}
+                <circle
+                  cx="50%" cy="50%" r="45%"
+                  stroke="lime"
+                  strokeWidth="8"
+                  fill="none"
+                  strokeLinecap="round"
+                  strokeDasharray="282.6"             // full circumference
+                  strokeDashoffset={286.6-(accuracy / 100) * 282.6}
+                />
+              </svg>
+            </div>
+          </div>
+          
+          )}
+        </div>
+      </div>
+      </div>
+    </div>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: "center", alignItems: "center", padding: 20 },
-  title: { fontSize: 20, marginBottom: 10 },
-  camera: { width: 300, height: 400, borderRadius: 10, overflow: "hidden" },
-  controls: { flexDirection: "row", marginTop: 10, gap: 10 },
-});
